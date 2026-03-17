@@ -2,11 +2,12 @@
 # config
 
 IDF_TARGET=$1
-IS_XTENSA=$4
-OCT_FLASH="$2"
+CHIP_VARIANT=$2
+IS_XTENSA=$5
+OCT_FLASH="$3"
 OCT_PSRAM=
 
-if [ "$3" = "y" ]; then
+if [ "$4" = "y" ]; then
 	OCT_PSRAM="opi"
 else
 	OCT_PSRAM="qspi"
@@ -15,7 +16,7 @@ MEMCONF=$OCT_FLASH"_$OCT_PSRAM"
 
 source ./tools/config.sh
 
-echo "IDF_TARGET: $IDF_TARGET, MEMCONF: $MEMCONF, PWD: $PWD, OUT: $AR_SDK"
+echo "IDF_TARGET: $IDF_TARGET, CHIP_VARIANT: $CHIP_VARIANT, MEMCONF: $MEMCONF, PWD: $PWD, OUT: $AR_SDK"
 
 # clean previous
 if [ -e "$AR_SDK/sdkconfig" ]; then
@@ -90,12 +91,12 @@ fi
 # copy zigbee + zboss lib
 if [ -d "managed_components/espressif__esp-zigbee-lib/lib/$IDF_TARGET/" ]; then
 	cp -r "managed_components/espressif__esp-zigbee-lib/lib/$IDF_TARGET"/* "$AR_SDK/lib/"
-	EXCLUDE_LIBS+="esp_zb_api_ed;"
+	EXCLUDE_LIBS+="esp_zb_api.ed;esp_zb_api.zczr;"
 fi
 
 if [ -d "managed_components/espressif__esp-zboss-lib/lib/$IDF_TARGET/" ]; then
 	cp -r "managed_components/espressif__esp-zboss-lib/lib/$IDF_TARGET"/* "$AR_SDK/lib/"
-	EXCLUDE_LIBS+="zboss_stack.ed;zboss_port.debug;"
+	EXCLUDE_LIBS+="zboss_stack.ed;zboss_stack.zczr;zboss_port.native;zboss_port.native.debug;zboss_port.remote;zboss_port.remote.debug;"
 fi
 
 #collect includes, defines and c-flags
@@ -318,16 +319,23 @@ done
 
 mkdir -p "$AR_SDK"
 
+# Keep only -march, -mabi and -mlongcalls flags for Assembler
+PIOARDUINO_AS_FLAGS=$(
+    {
+        echo "$PIOARDUINO_CXX_FLAGS" | grep -oE '\-march=[^[:space:]]*|\-mabi=[^[:space:]]*|\-mlongcalls'
+        echo "$PIOARDUINO_CC_FLAGS" | grep -oE '\-march=[^[:space:]]*|\-mabi=[^[:space:]]*|\-mlongcalls'
+    } | awk '!seen[$0]++' | paste -sd ' '
+)
+
 # start generation of pioarduino-build.py
 AR_PIOARDUINO_PY="$AR_SDK/pioarduino-build.py"
 cat configs/pioarduino_start.txt > "$AR_PIOARDUINO_PY"
 
 echo "    ASFLAGS=[" >> "$AR_PIOARDUINO_PY"
-if [ "$IS_XTENSA" = "y" ]; then
-	echo "        \"-mlongcalls\"" >> "$AR_PIOARDUINO_PY"
-else
-	echo "        \"-march=rv32imc\"" >> "$AR_PIOARDUINO_PY"
-fi
+set -- $PIOARDUINO_AS_FLAGS
+for item; do
+	echo "        \"$item\"," >> "$AR_PIOARDUINO_PY"
+done
 echo "    ]," >> "$AR_PIOARDUINO_PY"
 echo "" >> "$AR_PIOARDUINO_PY"
 
@@ -445,11 +453,122 @@ for item; do
 			mkdir -p "$out_cpath$rel_p"
 			cp -n $f "$out_cpath$rel_p/"
 		done
-		# Temporary measure to fix issues caused by https://github.com/espressif/esp-idf/commit/dc4731101dd567cc74bbe4d0f03afe52b7db9afb#diff-1d2ce0d3989a80830fdf230bcaafb3117f32046d16cf46616ac3d55b4df2a988R17
-		if [[ "$fname" == "bt" && "$out_sub" == "/include/$IDF_TARGET/include" && -f "$ipath/controller/$IDF_TARGET/esp_bt_cfg.h" ]]; then
-			mkdir -p "$AR_SDK/include/$fname/controller/$IDF_TARGET"
-			cp -n "$ipath/controller/$IDF_TARGET/esp_bt_cfg.h" "$AR_SDK/include/$fname/controller/$IDF_TARGET/esp_bt_cfg.h"
-		fi
+
+		# ---------------------------------------------------------------
+		# Auto-resolve relative #include paths
+		# ---------------------------------------------------------------
+		# Some copied headers use relative paths with "../" to reference
+		# files that live elsewhere in the component source tree and were
+		# not part of any include directory (so they were never copied).
+		#
+		# Example from the bt component:
+		#   esp_bt.h contains:
+		#     #include "../../../../controller/esp32/esp_bredr_cfg.h"
+		#
+		# This block scans the just-copied headers, extracts every
+		# #include ".../.../path" directive, resolves where the compiler
+		# would expect the file in the output SDK, locates the actual
+		# source file in the IDF tree, and copies it over.
+		#
+		# It loops to handle transitive dependencies (a newly copied
+		# header may itself contain relative includes). Circular deps
+		# are safe: already-existing files are skipped, so the loop
+		# naturally terminates.
+		#
+		# Key variables coming from the outer loop:
+		#   $item     - the IDF include directory currently being processed
+		#   $out_cpath - corresponding output directory in the SDK
+		#   $ipath    - root of the IDF component (e.g. esp-idf/components/bt)
+		#   $fname    - component name (e.g. "bt")
+		# ---------------------------------------------------------------
+
+		# Canonicalize the SDK path so string comparisons work even when
+		# the OS has symlinks (e.g. macOS: /var -> /private/var).
+		_canonical_sdk=$($REALPATH -m "$AR_SDK" 2>/dev/null)
+
+		# Seed the scan lists with headers we just copied into $out_cpath.
+		# _scan_out  - output file paths (in the SDK) to scan
+		# _scan_srcdir - matching source directories (in the IDF tree)
+		_scan_out=()
+		_scan_srcdir=()
+		while IFS= read -r -d '' _f; do
+			_fdir=$(dirname "$_f")
+			_scan_out+=("$_f")
+			# Map the output dir back to the source dir:
+			# strip the $out_cpath prefix, then prepend $item.
+			_scan_srcdir+=("$item${_fdir#$out_cpath}")
+		done < <(find "$out_cpath" \( -name '*.h' -o -name '*.hpp' -o -name '*.inc' \) -print0 2>/dev/null)
+
+		while [ ${#_scan_out[@]} -gt 0 ]; do
+			_next_out=()
+			_next_srcdir=()
+
+			for _idx in "${!_scan_out[@]}"; do
+				_f="${_scan_out[$_idx]}"
+				_srcdir="${_scan_srcdir[$_idx]}"
+				_outdir=$(dirname "$_f")
+
+				# Extract relative include paths (containing "../") from
+				# the header. The grep matches #include "path", the sed
+				# strips the #include " prefix and trailing ".
+				while IFS= read -r _rel_include; do
+
+					# Resolve where the compiler would look for this file
+					# relative to the header's location in the output SDK.
+					_resolved_out=$($REALPATH -m "$_outdir/$_rel_include" 2>/dev/null)
+
+					# Skip if: resolution failed, target is outside the
+					# SDK (safety), or the file already exists (handles
+					# duplicates and circular dependencies).
+					if [ -z "$_resolved_out" ] || [[ "$_resolved_out" != "$_canonical_sdk/"* ]] || [ -f "$_resolved_out" ]; then
+						continue
+					fi
+
+					# Locate the actual source file in the IDF tree.
+					# Method 1: resolve the same relative path from the
+					# header's original source directory. This works well
+					# for transitive deps whose source location is known.
+					_resolved_src=$($REALPATH -m "$_srcdir/$_rel_include" 2>/dev/null)
+
+					# Method 2 (fallback): when the "../" chain escapes
+					# above the include subdir, method 1 resolves to a
+					# path that doesn't exist. In that case, strip the
+					# leading "../" segments to get the tail (e.g.
+					# "controller/esp32/file.h") and look for it under
+					# the component root ($ipath).
+					if [ -z "$_resolved_src" ] || [ ! -f "$_resolved_src" ]; then
+						_tail=$(echo "$_rel_include" | sed 's|^\(\.\./\)*||')
+						_resolved_src="$ipath/$_tail"
+					fi
+
+					if [ -f "$_resolved_src" ]; then
+						# Only copy header/include files, skip source
+						# files (.c, .cpp, .S, etc.) that happen to be
+						# referenced via relative includes.
+						case "$_resolved_src" in
+							*.h|*.hpp|*.inc) ;;
+							*) continue ;;
+						esac
+						mkdir -p "$(dirname "$_resolved_out")"
+						cp -n "$_resolved_src" "$_resolved_out"
+						echo "Auto-copied missing relative include: $_rel_include (from $(basename "$_f"))"
+						# Queue the newly copied file for scanning in the
+						# next iteration (transitive dependency resolution).
+						_next_out+=("$_resolved_out")
+						_next_srcdir+=("$(dirname "$_resolved_src")")
+					fi
+
+				done < <(grep -o '#include *"[^"]*\.\./[^"]*"' "$_f" 2>/dev/null | sed 's/#include *"//;s/"$//')
+			done
+
+			# If nothing new was copied this iteration, all transitive
+			# dependencies have been resolved -- we're done.
+			if [ ${#_next_out[@]} -eq 0 ]; then
+				break
+			fi
+			_scan_out=("${_next_out[@]}")
+			_scan_srcdir=("${_next_srcdir[@]}")
+		done
 	fi
 done
 echo "        join($PIOARDUINO_SDK, board_config.get(\"build.arduino.memory_type\", (board_config.get(\"build.flash_mode\", \"dio\") + \"_$OCT_PSRAM\")), \"include\")," >> "$AR_PIOARDUINO_PY"
@@ -504,6 +623,11 @@ done
 # end generation of pioarduino-build.py
 cat configs/pioarduino_end.txt >> "$AR_PIOARDUINO_PY"
 
+# Matter Library adjustments
+echo "Fixing $AR_PIOARDUINO_PY"
+sed 's/\\\"-DCHIP_ADDRESS_RESOLVE_IMPL_INCLUDE_HEADER=<lib\/address_resolve\/AddressResolve_DefaultImpl.h>\\\"/-DCHIP_HAVE_CONFIG_H/' $AR_PIOARDUINO_PY > $AR_PIOARDUINO_PY.temp
+mv $AR_PIOARDUINO_PY.temp $AR_PIOARDUINO_PY
+
 # replace double backslashes with single one
 DEFINES=`echo "$DEFINES" | tr -s '\'`
 
@@ -525,9 +649,10 @@ for flag_file in "c_flags" "cpp_flags" "S_flags"; do
  	sed 's/\\\"-DCHIP_ADDRESS_RESOLVE_IMPL_INCLUDE_HEADER=<lib\/address_resolve\/AddressResolve_DefaultImpl.h>\\\"/-DCHIP_HAVE_CONFIG_H/' $FLAGS_DIR/$flag_file > $FLAGS_DIR/$flag_file.temp
 	mv $FLAGS_DIR/$flag_file.temp $FLAGS_DIR/$flag_file
 done
-CHIP_RESOLVE_DIR="$AR_SDK/include/espressif__esp_matter/connectedhomeip/connectedhomeip/src/lib/address_resolve"
-sed 's/CHIP_ADDRESS_RESOLVE_IMPL_INCLUDE_HEADER/<lib\/address_resolve\/AddressResolve_DefaultImpl.h>/' $CHIP_RESOLVE_DIR/AddressResolve.h > $CHIP_RESOLVE_DIR/AddressResolve_temp.h
-mv $CHIP_RESOLVE_DIR/AddressResolve_temp.h $CHIP_RESOLVE_DIR/AddressResolve.h
+# this is not necessary for Matter 1.4, but it is for Matter 1.3
+#CHIP_RESOLVE_DIR="$AR_SDK/include/espressif__esp_matter/connectedhomeip/connectedhomeip/src/lib/address_resolve"
+#sed 's/CHIP_ADDRESS_RESOLVE_IMPL_INCLUDE_HEADER/<lib\/address_resolve\/AddressResolve_DefaultImpl.h>/' $CHIP_RESOLVE_DIR/AddressResolve.h > $CHIP_RESOLVE_DIR/AddressResolve_temp.h
+#mv $CHIP_RESOLVE_DIR/AddressResolve_temp.h $CHIP_RESOLVE_DIR/AddressResolve.h
 # End of Matter Library adjustments
 
 # sdkconfig
@@ -573,7 +698,7 @@ mv "$PWD/build/config/sdkconfig.h" "$AR_SDK/$MEMCONF/include/sdkconfig.h"
 for mem_variant in `jq -c '.mem_variants_files[]' configs/builds.json`; do
 	skip_file=1
 	for file_target in $(echo "$mem_variant" | jq -c '.targets[]' | tr -d '"'); do
-		if [ "$file_target" == "$IDF_TARGET" ]; then
+		if [ "$file_target" == "$CHIP_VARIANT" ]; then
 			skip_file=0
 			break
 		fi

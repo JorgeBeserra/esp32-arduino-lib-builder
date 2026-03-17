@@ -2,7 +2,7 @@
 
 source ./tools/install-arduino.sh
 
-if [ -x $GITHUB_TOKEN ]; then
+if [ -z "$GITHUB_TOKEN" ]; then
 	echo "ERROR: GITHUB_TOKEN was not defined"
 	exit 1
 fi
@@ -25,18 +25,18 @@ LIBS_JSON_FILENAME="package-$LIBS_VERSION.json"
 IDF_LIBS_ZIP_URL="https://github.com/$AR_LIBS_REPO/releases/download/$LIBS_RELEASE_TAG/$LIBS_ZIP_FILENAME"
 IDF_LIBS_JSON_URL="https://github.com/$AR_LIBS_REPO/releases/download/$LIBS_RELEASE_TAG/$LIBS_JSON_FILENAME"
 
-if [ $AR_HAS_COMMIT == "0" ] || [ $LIBS_HAS_ASSET == "0" ]; then
+if [ "$AR_HAS_COMMIT" == "0" ] || [ "$LIBS_HAS_ASSET" == "0" ]; then
 	cd "$AR_ROOT"
 	mkdir -p dist
 
 	# check if the release exists
-	if [ $LIBS_HAS_RELEASE == "0" ]; then
+	if [ "$LIBS_HAS_RELEASE" == "0" ]; then
 		echo "Release for tag \"$LIBS_RELEASE_TAG\" not found. Please create the release first."
 		exit 1
 	fi
 
 	# Delete old assets for the version
-	if [ $LIBS_HAS_ASSET == "1" ]; then
+	if [ "$LIBS_HAS_ASSET" == "1" ]; then
 		echo "Deleting existing assets for version '$LIBS_VERSION'..."
 		if [ `github_release_asset_delete "$AR_LIBS_REPO" "$LIBS_ASSET_ID"` == "0" ]; then
 			echo "ERROR: Failed to delete asset '$LIBS_ZIP_FILENAME'"
@@ -47,16 +47,22 @@ if [ $AR_HAS_COMMIT == "0" ] || [ $LIBS_HAS_ASSET == "0" ]; then
 		fi
 	fi
 
+	sleep 5
 	echo "Creating asset '$LIBS_ZIP_FILENAME'..."
-
 	mv -f "dist/esp32-arduino-libs.zip" "dist/$LIBS_ZIP_FILENAME"
+
 	LIBS_ASSET_ID=`github_release_asset_upload "$AR_LIBS_REPO" "$LIBS_RELEASE_ID" "$LIBS_ZIP_FILENAME" "dist/$LIBS_ZIP_FILENAME"`
 	if [ -z "$LIBS_ASSET_ID" ]; then
-		echo "ERROR: Failed to upload asset '$LIBS_ZIP_FILENAME'"
-		exit 1
+		echo "ERROR: Failed to upload asset '$LIBS_ZIP_FILENAME. Retrying..."
+		LIBS_ASSET_ID=`github_release_asset_upload "$AR_LIBS_REPO" "$LIBS_RELEASE_ID" "$LIBS_ZIP_FILENAME" "dist/$LIBS_ZIP_FILENAME"`
+		if [ -z "$LIBS_ASSET_ID" ]; then
+			echo "ERROR: Failed to upload asset '$LIBS_ZIP_FILENAME'"
+			exit 1
+		fi
 	fi
 
 	echo "Finished uploading asset '$LIBS_ZIP_FILENAME'. Asset ID: $LIBS_ASSET_ID"
+	sleep 5
 
 	# Calculate the local file checksum and size
 	local_checksum=$(sha256sum "dist/$LIBS_ZIP_FILENAME" | awk '{print $1}')
@@ -108,8 +114,12 @@ if [ $AR_HAS_COMMIT == "0" ] || [ $LIBS_HAS_ASSET == "0" ]; then
 
 	JSON_ASSET_ID=`github_release_asset_upload "$AR_LIBS_REPO" "$LIBS_RELEASE_ID" "$LIBS_JSON_FILENAME" "$AR_OUT/package_esp32_index.template.json"`
 	if [ -z "$JSON_ASSET_ID" ]; then
-		echo "ERROR: Failed to upload asset '$LIBS_JSON_FILENAME'"
-		exit 1
+		echo "ERROR: Failed to upload asset '$LIBS_JSON_FILENAME'. Retrying..."
+		JSON_ASSET_ID=`github_release_asset_upload "$AR_LIBS_REPO" "$LIBS_RELEASE_ID" "$LIBS_JSON_FILENAME" "$AR_OUT/package_esp32_index.template.json"`
+		if [ -z "$JSON_ASSET_ID" ]; then
+			echo "ERROR: Failed to upload asset '$LIBS_JSON_FILENAME'"
+			exit 1
+		fi
 	fi
 fi
 
@@ -117,54 +127,54 @@ fi
 # esp32-arduino
 #
 
-if [ $AR_HAS_COMMIT == "0" ] || [ $LIBS_HAS_ASSET == "0" ]; then
+if [ "$AR_HAS_COMMIT" == "0" ] || [ "$LIBS_HAS_ASSET" == "0" ]; then
 	cd "$AR_ROOT"
 	# create or checkout the branch
-	if [ ! $AR_HAS_BRANCH == "0" ]; then
-		echo "Switching to arduino branch '$AR_NEW_BRANCH_NAME'..."
-		git -C "$AR_COMPS/arduino" checkout $AR_NEW_BRANCH_NAME
+	if [ ! "$AR_HAS_PR_BRANCH" == "0" ]; then
+		echo "Switching to arduino branch '$AR_PR_BRANCH'..."
+		git -C "$AR_COMPS/arduino" checkout $AR_PR_BRANCH
 	else
-		echo "Creating arduino branch '$AR_NEW_BRANCH_NAME'..."
-		git -C "$AR_COMPS/arduino" checkout -b $AR_NEW_BRANCH_NAME
+		echo "Creating arduino branch '$AR_PR_BRANCH'..."
+		git -C "$AR_COMPS/arduino" checkout -b $AR_PR_BRANCH
 	fi
 	if [ $? -ne 0 ]; then
-		echo "ERROR: Checkout of branch '$AR_NEW_BRANCH_NAME' failed"
+		echo "ERROR: Checkout of branch '$AR_PR_BRANCH' failed"
 		exit 1
 	fi
 
 	# make changes to the files
-	echo "Patching files in branch '$AR_NEW_BRANCH_NAME'..."
+	echo "Patching files in branch '$AR_PR_BRANCH'..."
 	rm -rf "$AR_COMPS/arduino/package/package_esp32_index.template.json" && cp -f "$AR_OUT/package_esp32_index.template.json" "$AR_COMPS/arduino/package/package_esp32_index.template.json"
 
 	cd $AR_COMPS/arduino
 
 	# did any of the files change?
 	if [ -n "$(git status --porcelain)" ]; then
-		echo "Pushing changes to branch '$AR_NEW_BRANCH_NAME'..."
-		git add . && git commit --message "$AR_NEW_COMMIT_MESSAGE" && git push -u origin $AR_NEW_BRANCH_NAME
+		echo "Pushing changes to branch '$AR_PR_BRANCH'..."
+		git add . && git commit --message "$AR_PR_COMMIT_MESSAGE" && git push -u origin $AR_PR_BRANCH
 		if [ $? -ne 0 ]; then
-			echo "ERROR: Pushing to branch '$AR_NEW_BRANCH_NAME' failed"
+			echo "ERROR: Pushing to branch '$AR_PR_BRANCH' failed"
 			exit 1
 		fi
 	else
-		echo "No changes in branch '$AR_NEW_BRANCH_NAME'"
-		if [ $AR_HAS_BRANCH == "0" ]; then
-			echo "Delete created branch '$AR_NEW_BRANCH_NAME'"
-			git branch -d $AR_NEW_BRANCH_NAME
+		echo "No changes in branch '$AR_PR_BRANCH'"
+		if [ "$AR_HAS_PR_BRANCH" == "0" ]; then
+			echo "Delete created branch '$AR_PR_BRANCH'"
+			git branch -d $AR_PR_BRANCH
 		fi
 		exit 0
 	fi
 
 	# CREATE PULL REQUEST
 	if [ "$AR_HAS_PR" == "0" ]; then
-		echo "Creating PR '$AR_NEW_PR_TITLE'..."
-		pr_created=`git_create_pr "$AR_NEW_BRANCH_NAME" "$AR_NEW_PR_TITLE" "$AR_PR_TARGET_BRANCH"`
+		echo "Creating PR '$AR_PR_TITLE'..."
+		pr_created=`git_create_pr "$AR_PR_BRANCH" "$AR_PR_TITLE" "$AR_PR_TARGET_BRANCH"`
 		if [ $pr_created == "0" ]; then
-			echo "ERROR: Failed to create PR '$AR_NEW_PR_TITLE': "`echo "$git_create_pr_res" | jq -r '.message'`": "`echo "$git_create_pr_res" | jq -r '.errors[].message'`
+			echo "ERROR: Failed to create PR '$AR_PR_TITLE': "`echo "$git_create_pr_res" | jq -r '.message'`": "`echo "$git_create_pr_res" | jq -r '.errors[].message'`
 			exit 1
 		fi
 	else
-		echo "PR '$AR_NEW_PR_TITLE' Already Exists"
+		echo "PR '$AR_PR_TITLE' Already Exists"
 	fi
 fi
 

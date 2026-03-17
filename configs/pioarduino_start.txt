@@ -36,6 +36,7 @@ FRAMEWORK_SDK_DIR = env.PioPlatform().get_package_dir(
 )
 
 board_config = env.BoardConfig()
+build_mcu = board_config.get("build.mcu", "").lower()
 
 flatten_cppdefines = env.Flatten(env['CPPDEFINES'])
 
@@ -45,28 +46,28 @@ flatten_cppdefines = env.Flatten(env['CPPDEFINES'])
 if "ZIGBEE_MODE_ZCZR" in flatten_cppdefines:
     env.Append(
         LIBS=[
-            "-lesp_zb_api_zczr",
-            "-lesp_zb_cli_command",
-            "-lzboss_stack.zczr",
-            "-lzboss_port"
+            "-lesp_zb_api.zczr",
+            "-lzboss_stack.zczr"
         ]
     )
-if "ZIGBEE_MODE_ED" in flatten_cppdefines:
+if "ZIGBEE_MODE_ZCZR" in flatten_cppdefines and build_mcu in ["esp32c5", "esp32c6", "esp32h2"]:
     env.Append(
         LIBS=[
-            "-lesp_zb_api_ed",
-            "-lesp_zb_cli_command",
+            "-lzboss_port.native"
+        ]
+    )
+if "ZIGBEE_MODE_ED" in flatten_cppdefines and build_mcu in ["esp32c5", "esp32c6", "esp32h2"]:
+    env.Append(
+        LIBS=[
+            "-lesp_zb_api.ed",
             "-lzboss_stack.ed",
-            "-lzboss_port"
+            "-lzboss_port.native"
         ]
     )
-if "ZIGBEE_MODE_RCP" in flatten_cppdefines:
+if ("ZIGBEE_MODE_ZCZR" in flatten_cppdefines or "ZIGBEE_MODE_ED" in flatten_cppdefines) and build_mcu in ["esp32", "esp32s2", "esp32s3", "esp32c3"]:
     env.Append(
         LIBS=[
-            "-lesp_zb_api_rcp",
-            "-lesp_zb_cli_command",
-            "-lzboss_stack.rcp",
-            "-lzboss_port"
+            "-libzboss_port.remote"
         ]
     )
 
